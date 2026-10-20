@@ -16,12 +16,17 @@ defaults:
   run:
     shell: bash -xeuo pipefail {0}
 
-# `main` is protected by the "main: linear, no force-push, no deletion, PR +
-# test-bot" ruleset, which no GitHub Actions identity can bypass on a user-owned
-# repository (the ruleset has no bypass actors and cannot gain one for Actions).
-# The bottle commit is therefore published through a pull request instead of being
-# pushed straight to `main`. Runs must not overlap: a second run would start from
-# the pre-merge `main` and leave its pull request permanently behind.
+# `brew pr-pull` cherry-picks the pull request's commits onto `main`, so it can
+# only run while they are not on `main` yet: dispatch this on a pull request that
+# is still open and whose checks are green. Publishing one that has already been
+# merged fails with "The previous cherry-pick is now empty", whichever merge
+# method was used, so this workflow must run before the merge rather than after.
+#
+# The bottle commit is added to the pull request's own branch, as `homebrew/core`
+# does, and lands in `main` when that pull request is squash-merged. `main` is
+# protected by the "PR + test-bot" ruleset, which has no bypass actors and cannot
+# gain one for GitHub Actions, so a direct push of the bottle commit to `main` is
+# not possible.
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -30,11 +35,10 @@ jobs:
   pr-pull:
     runs-on: ubuntu-latest
     permissions:
-      # Everything read-only. Every write (branch push, pull request, merge) goes
-      # through the app token below instead: pushes and pull requests made with
-      # `GITHUB_TOKEN` do not trigger other workflows, so `tests.yml` would never
-      # run and the required `test-bot` checks would never appear on the bottle
-      # pull request.
+      # Read-only. The one write (pushing the bottle commit to the pull request
+      # branch) uses the app token below, because pushes made with `GITHUB_TOKEN`
+      # do not trigger other workflows and the required `test-bot` checks would
+      # never re-run on the bottle commit.
       actions: read
       attestations: write
       contents: read
@@ -67,6 +71,31 @@ jobs:
           # run. If the app is renamed, this slug must be updated.
           username: ${{ steps.app-token.outputs.app-slug }}[bot]
 
+      - name: Check pull request
+        id: pull_request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+        run: |
+          IFS=$'\t' read -r state head_branch head_sha cross < <(
+            gh pr view "$PULL_REQUEST" --json state,headRefName,headRefOid,isCrossRepository \
+              --jq '[.state, .headRefName, .headRefOid, (.isCrossRepository | tostring)] | @tsv'
+          )
+          if [[ "$state" != "OPEN" ]]
+          then
+            echo "::error::Pull request #$PULL_REQUEST is ${state,,}: publish its bottles before merging it"
+            exit 1
+          fi
+          if [[ "$cross" != "false" ]]
+          then
+            echo "::error::Pull request #$PULL_REQUEST is from a fork, so its branch cannot be pushed to"
+            exit 1
+          fi
+          {
+            echo "head_branch=$head_branch"
+            echo "head_sha=$head_sha"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Pull bottles
         id: pull_bottles
         env:
@@ -91,17 +120,25 @@ jobs:
         id: publish
         env:
           BOTTLE_DIR: ${{ steps.pull_bottles.outputs.bottle_path }}
+          HEAD_SHA: ${{ steps.pull_request.outputs.head_sha }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
         run: |
-          # `brew pr-pull` skips the upload, and so creates no commit, when the
-          # pull request did not touch anything with bottles: casks have none. The
-          # cherry-pick can also add nothing but empty commits, as the pull request
-          # has already been merged into `main`, so compare trees, not commits.
-          git fetch --quiet origin main
-          if git diff --quiet FETCH_HEAD HEAD
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2> /dev/null
           then
-            echo "No changes to publish: nothing to commit beyond $(git log --oneline -1)"
+            echo "::error::Pull request head $HEAD_SHA is missing from the local repository"
+            exit 1
+          fi
+
+          # `brew pr-pull` only adds bottle blocks to the files the pull request
+          # already changed, so a tree equal to the pull request's head means
+          # there is nothing to publish. That is the case for casks, which have no
+          # bottles at all.
+          if git diff --quiet "$HEAD_SHA" HEAD
+          then
+            echo "No bottle changes to publish for #${PULL_REQUEST}"
             echo "changes=false" >> "$GITHUB_OUTPUT"
           else
+            git diff --stat "$HEAD_SHA" HEAD
             echo "changes=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -120,67 +157,15 @@ jobs:
         with:
           subject-path: "${{ steps.pull_bottles.outputs.bottle_path }}/*.tar.gz"
 
-      - name: Push bottle commit to a branch
+      - name: Push bottle commits to the pull request
         if: steps.publish.outputs.changes == 'true'
-        id: push
         env:
+          HEAD_BRANCH: ${{ steps.pull_request.outputs.head_branch }}
+          HEAD_SHA: ${{ steps.pull_request.outputs.head_sha }}
           PULL_REQUEST: ${{ inputs.pull_request }}
         run: |
-          # One branch per release pull request, force-pushed so that a re-run
-          # updates the existing bottle pull request instead of opening a second.
-          branch="bottles/pr-${PULL_REQUEST}"
-          git push --force origin "HEAD:refs/heads/${branch}"
-          {
-            echo "branch=${branch}"
-            echo "sha=$(git rev-parse HEAD)"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Open bottle pull request
-        if: steps.publish.outputs.changes == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PULL_REQUEST: ${{ inputs.pull_request }}
-          BRANCH: ${{ steps.push.outputs.branch }}
-        run: |
-          # Only an open pull request can be reused: a closed one means this release
-          # pull request was already published, and merging it again is an error.
-          existing="$(gh pr view "$BRANCH" --json state,number \
-            --jq 'select(.state == "OPEN") | .number' 2> /dev/null || true)"
-          if [[ -n "$existing" ]]
-          then
-            echo "Reusing the open bottle pull request #$existing for $BRANCH"
-          else
-            gh pr create --base main --head "$BRANCH" \
-              --title "Publish bottles for #$PULL_REQUEST" \
-              --body "Bottle metadata generated by \`brew pr-pull\` from the bottles built and attested in #$PULL_REQUEST. Squash-merged by the workflow once the required \`test-bot\` checks pass."
-          fi
-
-      - name: Merge bottle pull request
-        if: steps.publish.outputs.changes == 'true'
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BRANCH: ${{ steps.push.outputs.branch }}
-          SHA: ${{ steps.push.outputs.sha }}
-        run: |
-          # `main` only allows squash merges and requires `test-bot` on both
-          # platforms, so wait for the pull request to become mergeable.
-          for _ in $(seq 1 120)
-          do
-            state="$(gh pr view "$BRANCH" --json mergeStateStatus --jq .mergeStateStatus)"
-            case "$state" in
-              CLEAN | HAS_HOOKS)
-                break
-                ;;
-              BEHIND | DIRTY | DRAFT)
-                echo "::error::$BRANCH is $state, so it needs manual attention"
-                exit 1
-                ;;
-            esac
-            sleep 10
-          done
-          if [[ "$state" != CLEAN && "$state" != HAS_HOOKS ]]
-          then
-            echo "::error::Timed out waiting for the checks on $BRANCH, merge it manually"
-            exit 1
-          fi
-          gh pr merge "$BRANCH" --squash --delete-branch --match-head-commit="$SHA"
+          # `brew pr-pull` commits the bottles on top of `main`, which does not
+          # descend from the pull request branch, so this rewrites that branch.
+          # The lease makes it fail loudly if somebody pushed to it meanwhile.
+          git push origin "HEAD:refs/heads/$HEAD_BRANCH" --force-with-lease="refs/heads/$HEAD_BRANCH:$HEAD_SHA"
+          echo "Pushed the bottle commits to $HEAD_BRANCH: merge #$PULL_REQUEST once its checks are green."
