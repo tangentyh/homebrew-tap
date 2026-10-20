@@ -1,6 +1,6 @@
 cask "displaykeep" do
-  version "1.3"
-  sha256 "584830ab33b7dcea3b8df86c802eea235673d2ba8ee5478e691913d371dab800"
+  version "1.3.1"
+  sha256 "8b71c079864f6f28f77c882ee429c11a1e998519c178c1fbeb7e181e27543bec"
 
   url "https://github.com/tangentyh/displaykeep/releases/download/v#{version}/displaykeep-#{version}.zip"
   name "DisplayKeep"
