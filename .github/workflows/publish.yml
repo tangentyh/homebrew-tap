@@ -16,30 +16,63 @@ defaults:
   run:
     shell: bash -xeuo pipefail {0}
 
+# `main` is protected by the "main: linear, no force-push, no deletion, PR +
+# test-bot" ruleset, which no GitHub Actions identity can bypass on a user-owned
+# repository (the ruleset has no bypass actors and cannot gain one for Actions).
+# The bottle commit is therefore published through a pull request instead of being
+# pushed straight to `main`. Runs must not overlap: a second run would start from
+# the pre-merge `main` and leave its pull request permanently behind.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   pr-pull:
     runs-on: ubuntu-latest
     permissions:
+      # Everything read-only. Every write (branch push, pull request, merge) goes
+      # through the app token below instead: pushes and pull requests made with
+      # `GITHUB_TOKEN` do not trigger other workflows, so `tests.yml` would never
+      # run and the required `test-bot` checks would never appear on the bottle
+      # pull request.
       actions: read
       attestations: write
-      checks: read
-      contents: write
+      contents: read
       id-token: write
       issues: read
-      pull-requests: write
+      pull-requests: read
     steps:
+      # App installation token: expires after 1 hour, is minted per run and is
+      # revoked when the job finishes.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AUTOBUMP_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOBUMP_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Set up Homebrew
         uses: Homebrew/actions/setup-homebrew@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Set up git
         id: git_setup
         uses: Homebrew/actions/git-user-config@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          # Commit as the app's bot user rather than the human who triggered the
+          # run. If the app is renamed, this slug must be updated.
+          username: ${{ steps.app-token.outputs.app-slug }}[bot]
 
       - name: Pull bottles
         id: pull_bottles
         env:
+          # Downloading the bottle artifacts needs `actions: read`, which the app
+          # token does not have. Everything `brew pr-pull` does with this token is
+          # a read.
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_GIT_COMMITTER_NAME: ${{ steps.git_setup.outputs.name }}
           HOMEBREW_GIT_COMMITTER_EMAIL: ${{ steps.git_setup.outputs.email }}
@@ -54,12 +87,100 @@ jobs:
             brew pr-pull --debug --retain-bottle-dir --tap="$GITHUB_REPOSITORY" "$PULL_REQUEST"
           fi
 
+      - name: Check what needs publishing
+        id: publish
+        env:
+          BOTTLE_DIR: ${{ steps.pull_bottles.outputs.bottle_path }}
+        run: |
+          # `brew pr-pull` skips the upload, and so creates no commit, when the
+          # pull request did not touch anything with bottles: casks have none. The
+          # cherry-pick can also add nothing but empty commits, as the pull request
+          # has already been merged into `main`, so compare trees, not commits.
+          git fetch --quiet origin main
+          if git diff --quiet FETCH_HEAD HEAD
+          then
+            echo "No changes to publish: nothing to commit beyond $(git log --oneline -1)"
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # `--retain-bottle-dir` sets `bottle_path` even when nothing was
+          # downloaded, and `actions/attest` fails on a glob that matches nothing.
+          if compgen -G "${BOTTLE_DIR:-}/[!.]*.tar.gz" > /dev/null
+          then
+            echo "bottles=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bottles=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Generate build provenance
+        if: steps.publish.outputs.bottles == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "${{ steps.pull_bottles.outputs.bottle_path }}/*.tar.gz"
 
-      - name: Push commits
-        uses: Homebrew/actions/git-try-push@eb02c69dbabdb66ff183c614f4ce7ab3c077592c # 2026.10.12.1
-        with:
-          branch: main
+      - name: Push bottle commit to a branch
+        if: steps.publish.outputs.changes == 'true'
+        id: push
+        env:
+          PULL_REQUEST: ${{ inputs.pull_request }}
+        run: |
+          # One branch per release pull request, force-pushed so that a re-run
+          # updates the existing bottle pull request instead of opening a second.
+          branch="bottles/pr-${PULL_REQUEST}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+          {
+            echo "branch=${branch}"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open bottle pull request
+        if: steps.publish.outputs.changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PULL_REQUEST: ${{ inputs.pull_request }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+        run: |
+          # Only an open pull request can be reused: a closed one means this release
+          # pull request was already published, and merging it again is an error.
+          existing="$(gh pr view "$BRANCH" --json state,number \
+            --jq 'select(.state == "OPEN") | .number' 2> /dev/null || true)"
+          if [[ -n "$existing" ]]
+          then
+            echo "Reusing the open bottle pull request #$existing for $BRANCH"
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "Publish bottles for #$PULL_REQUEST" \
+              --body "Bottle metadata generated by \`brew pr-pull\` from the bottles built and attested in #$PULL_REQUEST. Squash-merged by the workflow once the required \`test-bot\` checks pass."
+          fi
+
+      - name: Merge bottle pull request
+        if: steps.publish.outputs.changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          # `main` only allows squash merges and requires `test-bot` on both
+          # platforms, so wait for the pull request to become mergeable.
+          for _ in $(seq 1 120)
+          do
+            state="$(gh pr view "$BRANCH" --json mergeStateStatus --jq .mergeStateStatus)"
+            case "$state" in
+              CLEAN | HAS_HOOKS)
+                break
+                ;;
+              BEHIND | DIRTY | DRAFT)
+                echo "::error::$BRANCH is $state, so it needs manual attention"
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          if [[ "$state" != CLEAN && "$state" != HAS_HOOKS ]]
+          then
+            echo "::error::Timed out waiting for the checks on $BRANCH, merge it manually"
+            exit 1
+          fi
+          gh pr merge "$BRANCH" --squash --delete-branch --match-head-commit="$SHA"
