@@ -27,6 +27,11 @@ defaults:
 # protected by the "PR + test-bot" ruleset, which has no bypass actors and cannot
 # gain one for GitHub Actions, so a direct push of the bottle commit to `main` is
 # not possible.
+#
+# `Formula/.gitkeep` must stay: when the checkout has neither a `Formula` nor a
+# `HomebrewFormula` directory, `Tap#formula_dir` falls back to the tap root, and
+# `brew pr-pull` then treats `Casks/*.rb` as formulae and aborts with "No
+# available formula with the name .../displaykeep".
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: false
@@ -116,38 +121,24 @@ jobs:
             brew pr-pull --debug --retain-bottle-dir --tap="$GITHUB_REPOSITORY" "$PULL_REQUEST"
           fi
 
-      - name: Check what needs publishing
+      - name: Check for bottles
         id: publish
         env:
           BOTTLE_DIR: ${{ steps.pull_bottles.outputs.bottle_path }}
-          HEAD_SHA: ${{ steps.pull_request.outputs.head_sha }}
           PULL_REQUEST: ${{ inputs.pull_request }}
         run: |
-          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2> /dev/null
-          then
-            echo "::error::Pull request head $HEAD_SHA is missing from the local repository"
-            exit 1
-          fi
-
-          # `brew pr-pull` only adds bottle blocks to the files the pull request
-          # already changed, so a tree equal to the pull request's head means
-          # there is nothing to publish. That is the case for casks, which have no
-          # bottles at all.
-          if git diff --quiet "$HEAD_SHA" HEAD
-          then
-            echo "No bottle changes to publish for #${PULL_REQUEST}"
-            echo "changes=false" >> "$GITHUB_OUTPUT"
-          else
-            git diff --stat "$HEAD_SHA" HEAD
-            echo "changes=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          # `brew pr-pull` downloads artifacts, and so runs `brew pr-upload` and
+          # commits the bottle blocks, only when the pull request touched a
+          # formula. Casks have no bottles, so a cask pull request is a no-op.
+          #
           # `--retain-bottle-dir` sets `bottle_path` even when nothing was
           # downloaded, and `actions/attest` fails on a glob that matches nothing.
           if compgen -G "${BOTTLE_DIR:-}/[!.]*.tar.gz" > /dev/null
           then
+            ls -l "$BOTTLE_DIR"
             echo "bottles=true" >> "$GITHUB_OUTPUT"
           else
+            echo "No bottles to publish for #${PULL_REQUEST}: nothing to commit"
             echo "bottles=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -158,7 +149,7 @@ jobs:
           subject-path: "${{ steps.pull_bottles.outputs.bottle_path }}/*.tar.gz"
 
       - name: Push bottle commits to the pull request
-        if: steps.publish.outputs.changes == 'true'
+        if: steps.publish.outputs.bottles == 'true'
         env:
           HEAD_BRANCH: ${{ steps.pull_request.outputs.head_branch }}
           HEAD_SHA: ${{ steps.pull_request.outputs.head_sha }}
