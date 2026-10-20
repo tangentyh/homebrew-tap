@@ -20,7 +20,12 @@ defaults:
 
 jobs:
   autobump:
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest, unlike the `brew tap-new` template this file came from: `brew bump`
+    # audits the cask it is about to bump, and auditing an `app` stanza reads the bundle's
+    # Info.plist with plutil, which is macOS-only. On Linux the audit dies with
+    # "/usr/bin/env: 'plutil': No such file or directory" (exit 127) *after* downloading the
+    # new release, so no PR is opened and the cask silently stays on the old version.
+    runs-on: macos-latest
     permissions:
       # The Minted GitHub App token (not GITHUB_TOKEN) does the pushing and PR
       # creation, so GITHUB_TOKEN needs nothing beyond read access.
