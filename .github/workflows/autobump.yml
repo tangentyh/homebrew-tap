@@ -10,6 +10,11 @@ on:
   schedule:
     # Every day at 4:25 UTC
     - cron: 25 4 * * *
+    # Retry slot at 12:25 UTC: GitHub does not retry scheduled workflows, and a
+    # `macos-latest` job can sit in the queue and be cancelled without running a
+    # single step when hosted macOS arm64 capacity is exhausted (seen 2026-11-25).
+    # `brew bump` is idempotent: with nothing newer to bump this run is a no-op.
+    - cron: 25 12 * * *
   workflow_dispatch:
 
 permissions: {}
@@ -26,6 +31,14 @@ jobs:
     # "/usr/bin/env: 'plutil': No such file or directory" (exit 127) *after* downloading the
     # new release, so no PR is opened and the cask silently stays on the old version.
     runs-on: macos-latest
+    # A runner that is never acquired (or a step that hangs) would otherwise sit
+    # here silently; a stalled queue is reported as a failed job within 30m.
+    timeout-minutes: 30
+    # Re-runs and the retry slot must not overlap: two concurrent `brew bump`
+    # runs race to open PRs for the same cask. Never cancel a bump midway.
+    concurrency:
+      group: ${{ github.workflow }}
+      cancel-in-progress: false
     permissions:
       # The Minted GitHub App token (not GITHUB_TOKEN) does the pushing and PR
       # creation, so GITHUB_TOKEN needs nothing beyond read access.
